@@ -1,0 +1,104 @@
+
+import duckdb
+import os
+
+os.makedirs("output/temp", exist_ok=True)
+
+con = duckdb.connect("home_analysis.duckdb")
+
+con.execute("SET memory_limit = '4GB'")
+con.execute("SET temp_directory = 'output/temp'")
+
+input_file = "output/home_prices_joined.parquet"
+
+REMOVE_ALL_GLOBAL_OUTLIERS = False
+
+bounds = con.execute(f"""
+    SELECT
+        QUANTILE_CONT(price, 0.25) AS q1,
+        QUANTILE_CONT(price, 0.75) AS q3
+    FROM read_parquet('{input_file}')
+    WHERE price IS NOT NULL
+""").fetchone()
+
+q1 = bounds[0]
+q3 = bounds[1]
+
+iqr = q3 - q1
+lower_bound = q1 - 1.5 * iqr
+upper_bound = q3 + 1.5 * iqr
+
+print("Global Q1:", q1)
+print("Global Q3:", q3)
+print("Global IQR:", iqr)
+print("Lower bound:", lower_bound)
+print("Upper bound:", upper_bound)
+
+con.execute(f"""
+    COPY (
+        SELECT *
+        FROM read_parquet('{input_file}')
+        WHERE price IS NOT NULL
+          AND (
+              price < {lower_bound}
+              OR price > {upper_bound}
+          )
+    )
+    TO 'output/global_price_outliers.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+outlier_count = con.execute("""
+    SELECT COUNT(*)
+    FROM read_parquet('output/global_price_outliers.parquet')
+""").fetchone()[0]
+
+print("Global price outlier records:", outlier_count)
+
+if REMOVE_ALL_GLOBAL_OUTLIERS:
+    price_filter = f"""
+        price IS NOT NULL
+        AND price >= {lower_bound}
+        AND price <= {upper_bound}
+    """
+else:
+    price_filter = "price IS NOT NULL"
+
+con.execute(f"""
+    COPY (
+        SELECT *
+        FROM read_parquet('{input_file}')
+        WHERE {price_filter}
+    )
+    TO 'output/home_prices_for_analysis.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+print("Analysis dataset saved.")
+
+con.execute("""
+    COPY (
+        SELECT
+            cluster_id,
+            CAST(createdDate AS DATE) AS createdDate,
+            AVG(price) AS avg_price,
+            MEDIAN(price) AS median_price,
+            COUNT(price) AS price_record_count,
+            COUNT(DISTINCT home_id) AS home_count
+        FROM read_parquet('output/home_prices_for_analysis.parquet')
+        GROUP BY
+            cluster_id,
+            CAST(createdDate AS DATE)
+    )
+    TO 'output/cluster_daily_summary.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+print("Daily cluster summary saved.")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE cluster_iqr AS
+    SELECT
+        cluster_id,
+        QUANTILE_CONT(avg_price, 0.25) AS q1,
+        QUANTILE_CONT(avg_price, 0.75) AS
