@@ -101,4 +101,77 @@ con.execute("""
     SELECT
         cluster_id,
         QUANTILE_CONT(avg_price, 0.25) AS q1,
-        QUANTILE_CONT(avg_price, 0.75) AS
+        QUANTILE_CONT(avg_price, 0.75) AS q3
+    FROM read_parquet('output/cluster_daily_summary.parquet')
+    GROUP BY cluster_id
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE cluster_iqr_bounds AS
+    SELECT
+        cluster_id,
+        q1,
+        q3,
+        q1 - 1.5 * (q3 - q1) AS lower_bound,
+        q3 + 1.5 * (q3 - q1) AS upper_bound
+    FROM cluster_iqr
+""")
+
+con.execute("""
+    COPY (
+        SELECT
+            d.cluster_id,
+            d.createdDate,
+            d.avg_price,
+            d.median_price,
+            d.price_record_count,
+            d.home_count,
+            b.q1,
+            b.q3,
+            b.lower_bound,
+            b.upper_bound,
+            CASE
+                WHEN d.avg_price < b.lower_bound
+                    THEN 'Low outlier'
+                WHEN d.avg_price > b.upper_bound
+                    THEN 'High outlier'
+            END AS outlier_type
+        FROM read_parquet('output/cluster_daily_summary.parquet') d
+        INNER JOIN cluster_iqr_bounds b
+            ON d.cluster_id = b.cluster_id
+        WHERE d.avg_price < b.lower_bound
+           OR d.avg_price > b.upper_bound
+    )
+    TO 'output/cluster_daily_outliers.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+print("Cluster time-series outliers saved.")
+
+print("\nGlobal outlier examples:")
+print(con.execute("""
+    SELECT *
+    FROM read_parquet('output/global_price_outliers.parquet')
+    ORDER BY price DESC
+    LIMIT 10
+""").fetchdf())
+
+print("\nHighest cluster-date price averages:")
+print(con.execute("""
+    SELECT *
+    FROM read_parquet('output/cluster_daily_outliers.parquet')
+    ORDER BY avg_price DESC
+    LIMIT 20
+""").fetchdf())
+
+print("\nOutlier summary:")
+print(con.execute("""
+    SELECT
+        COUNT(*) AS outlier_cluster_days,
+        COUNT(DISTINCT cluster_id) AS affected_clusters,
+        MIN(createdDate) AS first_outlier_date,
+        MAX(createdDate) AS last_outlier_date
+    FROM read_parquet('output/cluster_daily_outliers.parquet')
+""").fetchdf())
+
+con.close()
