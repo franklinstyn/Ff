@@ -11,98 +11,21 @@ con.execute("SET temp_directory = 'output/temp'")
 
 input_file = "output/home_prices_joined.parquet"
 
-REMOVE_ALL_GLOBAL_OUTLIERS = False
-
-bounds = con.execute(f"""
-    SELECT
-        QUANTILE_CONT(price, 0.25) AS q1,
-        QUANTILE_CONT(price, 0.75) AS q3
+con.execute(f"""
+    CREATE OR REPLACE TEMP TABLE price_data AS
+    SELECT *
     FROM read_parquet('{input_file}')
-    WHERE price IS NOT NULL
-""").fetchone()
-
-q1 = bounds[0]
-q3 = bounds[1]
-
-iqr = q3 - q1
-lower_bound = q1 - 1.5 * iqr
-upper_bound = q3 + 1.5 * iqr
-
-print("Global Q1:", q1)
-print("Global Q3:", q3)
-print("Global IQR:", iqr)
-print("Lower bound:", lower_bound)
-print("Upper bound:", upper_bound)
-
-con.execute(f"""
-    COPY (
-        SELECT *
-        FROM read_parquet('{input_file}')
-        WHERE price IS NOT NULL
-          AND (
-              price < {lower_bound}
-              OR price > {upper_bound}
-          )
-    )
-    TO 'output/global_price_outliers.parquet'
-    (FORMAT PARQUET, COMPRESSION ZSTD)
+    WHERE cluster_id IS NOT NULL
+      AND price IS NOT NULL
 """)
-
-outlier_count = con.execute("""
-    SELECT COUNT(*)
-    FROM read_parquet('output/global_price_outliers.parquet')
-""").fetchone()[0]
-
-print("Global price outlier records:", outlier_count)
-
-if REMOVE_ALL_GLOBAL_OUTLIERS:
-    price_filter = f"""
-        price IS NOT NULL
-        AND price >= {lower_bound}
-        AND price <= {upper_bound}
-    """
-else:
-    price_filter = "price IS NOT NULL"
-
-con.execute(f"""
-    COPY (
-        SELECT *
-        FROM read_parquet('{input_file}')
-        WHERE {price_filter}
-    )
-    TO 'output/home_prices_for_analysis.parquet'
-    (FORMAT PARQUET, COMPRESSION ZSTD)
-""")
-
-print("Analysis dataset saved.")
-
-con.execute("""
-    COPY (
-        SELECT
-            cluster_id,
-            CAST(createdDate AS DATE) AS createdDate,
-            AVG(price) AS avg_price,
-            MEDIAN(price) AS median_price,
-            COUNT(price) AS price_record_count,
-            COUNT(DISTINCT home_id) AS home_count
-        FROM read_parquet('output/home_prices_for_analysis.parquet')
-        GROUP BY
-            cluster_id,
-            CAST(createdDate AS DATE)
-    )
-    TO 'output/cluster_daily_summary.parquet'
-    (FORMAT PARQUET, COMPRESSION ZSTD)
-""")
-
-print("Daily cluster summary saved.")
 
 con.execute("""
     CREATE OR REPLACE TEMP TABLE cluster_iqr AS
     SELECT
         cluster_id,
-        QUANTILE_CONT(avg_price, 0.25) AS q1,
-        QUANTILE_CONT(avg_price, 0.75) AS q3
-    FROM read_parquet('output/cluster_daily_summary.parquet')
+        QUANTILE_CONT(price, 0.25) AS q1,
+        QUANTILE_CONT(price, 0.75) AS q3
+    FROM price_data
     GROUP BY cluster_id
 """)
 
@@ -118,60 +41,356 @@ con.execute("""
 """)
 
 con.execute("""
+    CREATE OR REPLACE TEMP TABLE cleaned_prices AS
+    SELECT d.*
+    FROM price_data d
+    INNER JOIN cluster_iqr_bounds b
+        ON d.cluster_id = b.cluster_id
+    WHERE d.price >= b.lower_bound
+      AND d.price <= b.upper_bound
+""")
+
+print("Original records:")
+print(con.execute("""
+    SELECT COUNT(*) FROM price_data
+""").fetchone()[0])
+
+print("Removed local outliers:")
+print(con.execute("""
+    SELECT COUNT(*)
+    FROM price_data d
+    INNER JOIN cluster_iqr_bounds b
+        ON d.cluster_id = b.cluster_id
+    WHERE d.price < b.lower_bound
+       OR d.price > b.upper_bound
+""").fetchone()[0])
+
+print("Remaining records:")
+print(con.execute("""
+    SELECT COUNT(*) FROM cleaned_prices
+""").fetchone()[0])
+
+con.execute("""
     COPY (
-        SELECT
-            d.cluster_id,
-            d.createdDate,
-            d.avg_price,
-            d.median_price,
-            d.price_record_count,
-            d.home_count,
-            b.q1,
-            b.q3,
-            b.lower_bound,
-            b.upper_bound,
-            CASE
-                WHEN d.avg_price < b.lower_bound
-                    THEN 'Low outlier'
-                WHEN d.avg_price > b.upper_bound
-                    THEN 'High outlier'
-            END AS outlier_type
-        FROM read_parquet('output/cluster_daily_summary.parquet') d
-        INNER JOIN cluster_iqr_bounds b
-            ON d.cluster_id = b.cluster_id
-        WHERE d.avg_price < b.lower_bound
-           OR d.avg_price > b.upper_bound
+        SELECT *
+        FROM cleaned_prices
     )
-    TO 'output/cluster_daily_outliers.parquet'
+    TO 'output/home_prices_cleaned.parquet'
     (FORMAT PARQUET, COMPRESSION ZSTD)
 """)
 
-print("Cluster time-series outliers saved.")
+con.execute("""
+    COPY (
+        SELECT
+            cluster_id,
+            CAST(createdDate AS DATE) AS createdDate,
+            AVG(price) AS avg_price,
+            MEDIAN(price) AS median_price,
+            COUNT(price) AS price_record_count,
+            COUNT(DISTINCT home_id) AS home_count
+        FROM cleaned_prices
+        GROUP BY
+            cluster_id,
+            CAST(createdDate AS DATE)
+    )
+    TO 'output/cluster_daily_summary_cleaned.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
 
-print("\nGlobal outlier examples:")
+print("\nCleaned daily cluster summary:")
+
 print(con.execute("""
     SELECT *
-    FROM read_parquet('output/global_price_outliers.parquet')
-    ORDER BY price DESC
-    LIMIT 10
-""").fetchdf())
-
-print("\nHighest cluster-date price averages:")
-print(con.execute("""
-    SELECT *
-    FROM read_parquet('output/cluster_daily_outliers.parquet')
-    ORDER BY avg_price DESC
+    FROM read_parquet('output/cluster_daily_summary_cleaned.parquet')
+    ORDER BY cluster_id, createdDate
     LIMIT 20
 """).fetchdf())
 
-print("\nOutlier summary:")
+con.close()
+
+
+
+
+
+import duckdb
+
+con = duckdb.connect("home_analysis.duckdb")
+
+con.execute("SET memory_limit = '4GB'")
+con.execute("SET temp_directory = 'output/temp'")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE cluster_trends AS
+    SELECT
+        *,
+        LAG(avg_price) OVER (
+            PARTITION BY cluster_id
+            ORDER BY createdDate
+        ) AS previous_avg_price,
+
+        AVG(avg_price) OVER (
+            PARTITION BY cluster_id
+            ORDER BY createdDate
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        ) AS moving_avg_7,
+
+        AVG(avg_price) OVER (
+            PARTITION BY cluster_id
+            ORDER BY createdDate
+            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+        ) AS moving_avg_30,
+
+        STDDEV_SAMP(avg_price) OVER (
+            PARTITION BY cluster_id
+            ORDER BY createdDate
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        ) AS price_volatility_7
+
+    FROM read_parquet('output/cluster_daily_summary_cleaned.parquet')
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE cluster_trends_final AS
+    SELECT
+        *,
+        CASE
+            WHEN previous_avg_price IS NOT NULL
+                 AND previous_avg_price != 0
+            THEN
+                ((avg_price - previous_avg_price)
+                / previous_avg_price) * 100
+        END AS daily_change_pct,
+
+        CASE
+            WHEN moving_avg_7 > moving_avg_30
+                THEN 'Upward'
+            WHEN moving_avg_7 < moving_avg_30
+                THEN 'Downward'
+            ELSE 'Stable'
+        END AS trend_direction
+
+    FROM cluster_trends
+""")
+
+con.execute("""
+    COPY (
+        SELECT *
+        FROM cluster_trends_final
+        ORDER BY cluster_id, createdDate
+    )
+    TO 'output/cluster_trends.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+print("Trend analysis completed.")
+
+print(con.execute("""
+    SELECT *
+    FROM cluster_trends_final
+    ORDER BY cluster_id, createdDate
+    LIMIT 20
+""").fetchdf())
+
+con.close()
+
+
+
+
+import duckdb
+import os
+
+os.makedirs("output/temp", exist_ok=True)
+
+con = duckdb.connect("home_analysis.duckdb")
+
+con.execute("SET memory_limit = '4GB'")
+con.execute("SET temp_directory = 'output/temp'")
+
+input_file = "output/cluster_daily_summary_cleaned.parquet"
+
+con.execute(f"""
+    CREATE OR REPLACE TEMP TABLE daily_changes AS
+    SELECT
+        *,
+        LAG(avg_price) OVER (
+            PARTITION BY cluster_id
+            ORDER BY createdDate
+        ) AS previous_avg_price
+    FROM read_parquet('{input_file}')
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE daily_changes_final AS
+    SELECT
+        *,
+        CASE
+            WHEN previous_avg_price IS NOT NULL
+                 AND previous_avg_price != 0
+            THEN
+                ((avg_price - previous_avg_price)
+                / previous_avg_price) * 100
+        END AS daily_change_pct
+    FROM daily_changes
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE cluster_ranking AS
+    SELECT
+        cluster_id,
+        MIN(createdDate) AS first_date,
+        MAX(createdDate) AS last_date,
+        FIRST(avg_price ORDER BY createdDate) AS first_avg_price,
+        LAST(avg_price ORDER BY createdDate) AS last_avg_price,
+        LAST(avg_price ORDER BY createdDate)
+            - FIRST(avg_price ORDER BY createdDate) AS price_difference,
+        (
+            LAST(avg_price ORDER BY createdDate)
+            - FIRST(avg_price ORDER BY createdDate)
+        ) / NULLIF(FIRST(avg_price ORDER BY createdDate), 0) * 100
+            AS price_change_pct
+    FROM read_parquet('output/cluster_daily_summary_cleaned.parquet')
+    GROUP BY cluster_id
+    HAVING COUNT(*) >= 2
+""")
+
+con.execute("""
+    COPY (
+        SELECT
+            *,
+            RANK() OVER (
+                ORDER BY price_change_pct DESC
+            ) AS increase_rank,
+            RANK() OVER (
+                ORDER BY price_change_pct ASC
+            ) AS decrease_rank
+        FROM cluster_ranking
+        ORDER BY price_change_pct DESC
+    )
+    TO 'output/cluster_price_ranking.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE cluster_volatility AS
+    SELECT
+        cluster_id,
+        COUNT(daily_change_pct) AS observation_count,
+        AVG(daily_change_pct) AS avg_daily_change_pct,
+        STDDEV_SAMP(daily_change_pct) AS price_volatility,
+        AVG(ABS(daily_change_pct)) AS avg_absolute_change_pct,
+        MAX(ABS(daily_change_pct)) AS maximum_absolute_change_pct
+    FROM daily_changes_final
+    GROUP BY cluster_id
+""")
+
+con.execute("""
+    COPY (
+        SELECT
+            *,
+            RANK() OVER (
+                ORDER BY price_volatility DESC
+            ) AS volatility_rank
+        FROM cluster_volatility
+        ORDER BY price_volatility DESC
+    )
+    TO 'output/cluster_price_volatility.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE spike_bounds AS
+    SELECT
+        cluster_id,
+        QUANTILE_CONT(daily_change_pct, 0.25) AS q1,
+        QUANTILE_CONT(daily_change_pct, 0.75) AS q3
+    FROM daily_changes_final
+    WHERE daily_change_pct IS NOT NULL
+    GROUP BY cluster_id
+    HAVING COUNT(daily_change_pct) >= 5
+""")
+
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE spike_results AS
+    SELECT
+        d.cluster_id,
+        d.createdDate,
+        d.previous_avg_price,
+        d.avg_price,
+        d.daily_change_pct,
+        b.q1,
+        b.q3,
+        b.q1 - 1.5 * (b.q3 - b.q1) AS lower_bound,
+        b.q3 + 1.5 * (b.q3 - b.q1) AS upper_bound,
+        CASE
+            WHEN d.daily_change_pct > b.q3 + 1.5 * (b.q3 - b.q1)
+                THEN 'Price spike'
+            WHEN d.daily_change_pct < b.q1 - 1.5 * (b.q3 - b.q1)
+                THEN 'Price drop'
+        END AS change_type
+    FROM daily_changes_final d
+    INNER JOIN spike_bounds b
+        ON d.cluster_id = b.cluster_id
+    WHERE d.daily_change_pct > b.q3 + 1.5 * (b.q3 - b.q1)
+       OR d.daily_change_pct < b.q1 - 1.5 * (b.q3 - b.q1)
+""")
+
+con.execute("""
+    COPY (
+        SELECT *
+        FROM spike_results
+        ORDER BY ABS(daily_change_pct) DESC
+    )
+    TO 'output/cluster_price_spikes.parquet'
+    (FORMAT PARQUET, COMPRESSION ZSTD)
+""")
+
+print("\nTop 10 clusters with highest price increases:")
+
+print(con.execute("""
+    SELECT *
+    FROM read_parquet('output/cluster_price_ranking.parquet')
+    ORDER BY increase_rank
+    LIMIT 10
+""").fetchdf())
+
+print("\nTop 10 clusters with largest price decreases:")
+
+print(con.execute("""
+    SELECT *
+    FROM read_parquet('output/cluster_price_ranking.parquet')
+    ORDER BY decrease_rank
+    LIMIT 10
+""").fetchdf())
+
+print("\nTop 10 most volatile clusters:")
+
+print(con.execute("""
+    SELECT *
+    FROM read_parquet('output/cluster_price_volatility.parquet')
+    ORDER BY volatility_rank
+    LIMIT 10
+""").fetchdf())
+
+print("\nLargest price spikes and drops:")
+
+print(con.execute("""
+    SELECT *
+    FROM read_parquet('output/cluster_price_spikes.parquet')
+    ORDER BY ABS(daily_change_pct) DESC
+    LIMIT 20
+""").fetchdf())
+
+print("\nSpike summary:")
+
 print(con.execute("""
     SELECT
-        COUNT(*) AS outlier_cluster_days,
+        change_type,
+        COUNT(*) AS total_events,
         COUNT(DISTINCT cluster_id) AS affected_clusters,
-        MIN(createdDate) AS first_outlier_date,
-        MAX(createdDate) AS last_outlier_date
-    FROM read_parquet('output/cluster_daily_outliers.parquet')
+        MIN(createdDate) AS first_date,
+        MAX(createdDate) AS last_date
+    FROM read_parquet('output/cluster_price_spikes.parquet')
+    GROUP BY change_type
 """).fetchdf())
 
 con.close()
