@@ -1,0 +1,695 @@
+
+import os
+import pandas as pd
+import numpy as np
+import pgeocode
+import duckdb
+
+from sqlalchemy import create_engine, text, URL
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import silhouette_score
+
+
+class Config:
+    DB_HOST = "localhost"
+    DB_PORT = 3306
+    DB_USER = "root"
+    DB_PASSWORD = "your_password"
+    DB_NAME = "your_database"
+
+    HOMES_TABLE = "homes"
+    PRICES_TABLE = "home_prices"
+    CLUSTERS_TABLE = "home_clusters"
+
+    HOME_ID = "home_id"
+    LATITUDE = "latitude"
+    LONGITUDE = "longitude"
+    ZIP_CODE = "zip"
+    PRICE = "price"
+    DATE = "createdDate"
+
+    # Initial DBSCAN: identify incorrect coordinates
+    INITIAL_EPS_KM = 10
+    INITIAL_MIN_SAMPLES = 5
+
+    # Final DBSCAN
+    FINAL_EPS_KM = 10
+    FINAL_MIN_SAMPLES = 1
+
+    EARTH_RADIUS_KM = 6371
+
+    SILHOUETTE_SAMPLE_SIZE = 2000
+    RANDOM_STATE = 42
+
+    IQR_MULTIPLIER = 1.5
+
+    DUCKDB_FILE = "housing_analysis.duckdb"
+    DUCKDB_MEMORY_LIMIT = "4GB"
+    DUCKDB_TEMP_DIR = "duckdb_temp"
+
+    OUTPUT_DIR = "output"
+
+
+class DatabaseManager:
+
+    def __init__(self):
+        self.engine = create_engine(
+            URL.create(
+                "mysql+pymysql",
+                username=Config.DB_USER,
+                password=Config.DB_PASSWORD,
+                host=Config.DB_HOST,
+                port=Config.DB_PORT,
+                database=Config.DB_NAME
+            ),
+            pool_pre_ping=True
+        )
+
+    def read_homes(self):
+        query = f"""
+            SELECT
+                {Config.HOME_ID},
+                {Config.LATITUDE},
+                {Config.LONGITUDE},
+                {Config.ZIP_CODE}
+            FROM {Config.HOMES_TABLE}
+        """
+
+        with self.engine.connect() as connection:
+            homes = pd.read_sql(text(query), connection)
+
+        return homes
+
+    def save_clusters(self, homes):
+
+        columns = [
+            Config.HOME_ID,
+            Config.LATITUDE,
+            Config.LONGITUDE,
+            Config.ZIP_CODE,
+            "cluster_id"
+        ]
+
+        data = homes[columns].copy()
+
+        staging_table = "home_clusters_staging"
+
+        with self.engine.begin() as connection:
+
+            data.to_sql(
+                staging_table,
+                connection,
+                if_exists="replace",
+                index=False
+            )
+
+            connection.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {Config.CLUSTERS_TABLE}
+                LIKE {staging_table}
+            """))
+
+            connection.execute(text(
+                f"DELETE FROM {Config.CLUSTERS_TABLE}"
+            ))
+
+            connection.execute(text(f"""
+                INSERT INTO {Config.CLUSTERS_TABLE}
+                SELECT * FROM {staging_table}
+            """))
+
+            connection.execute(text(
+                f"DROP TABLE {staging_table}"
+            ))
+
+        print("Clustered homes saved to MySQL.")
+
+    def close(self):
+        self.engine.dispose()
+
+
+class ClusterProcessor:
+
+    def __init__(self):
+        self.geocoder = pgeocode.Nominatim("us")
+
+    def get_radians(self, homes):
+        coordinates = homes[
+            [Config.LATITUDE, Config.LONGITUDE]
+        ].astype(float)
+
+        return np.radians(coordinates)
+
+    def detect_coordinate_outliers(self, homes):
+
+        coordinates = self.get_radians(homes)
+
+        model = DBSCAN(
+            eps=Config.INITIAL_EPS_KM / Config.EARTH_RADIUS_KM,
+            min_samples=Config.INITIAL_MIN_SAMPLES,
+            metric="haversine",
+            algorithm="ball_tree"
+        )
+
+        labels = model.fit_predict(coordinates)
+
+        outlier_indexes = homes.index[labels == -1]
+
+        print("Coordinate outliers:", len(outlier_indexes))
+
+        if len(outlier_indexes) != 2:
+            raise ValueError(
+                f"Expected 2 coordinate outliers, found "
+                f"{len(outlier_indexes)}. Check initial DBSCAN settings."
+            )
+
+        return outlier_indexes
+
+    def correct_coordinates(self, homes, outlier_indexes):
+
+        for index in outlier_indexes:
+
+            zip_code = homes.loc[index, Config.ZIP_CODE]
+
+            if pd.isna(zip_code):
+                raise ValueError(
+                    f"Missing ZIP code for home {homes.loc[index, Config.HOME_ID]}"
+                )
+
+            zip_code = str(zip_code).split(".")[0].zfill(5)
+
+            result = self.geocoder.query_postal_code(zip_code)
+
+            latitude = result["latitude"]
+            longitude = result["longitude"]
+
+            if pd.isna(latitude) or pd.isna(longitude):
+                raise ValueError(
+                    f"Could not find coordinates for ZIP {zip_code}"
+                )
+
+            homes.loc[index, Config.LATITUDE] = latitude
+            homes.loc[index, Config.LONGITUDE] = longitude
+
+        print("Incorrect coordinates corrected using ZIP codes.")
+
+        return homes
+
+    def apply_final_clustering(self, homes):
+
+        coordinates = self.get_radians(homes)
+
+        model = DBSCAN(
+            eps=Config.FINAL_EPS_KM / Config.EARTH_RADIUS_KM,
+            min_samples=Config.FINAL_MIN_SAMPLES,
+            metric="haversine",
+            algorithm="ball_tree"
+        )
+
+        homes["cluster_id"] = model.fit_predict(coordinates)
+
+        print("Total clusters:", homes["cluster_id"].nunique())
+        print("Noise points:", (homes["cluster_id"] == -1).sum())
+
+        return homes
+
+    def calculate_silhouette(self, homes):
+
+        valid_homes = homes[homes["cluster_id"] != -1].copy()
+
+        if valid_homes["cluster_id"].nunique() < 2:
+            print("Silhouette score requires at least 2 clusters.")
+            return None
+
+        sample_size = min(
+            Config.SILHOUETTE_SAMPLE_SIZE,
+            len(valid_homes)
+        )
+
+        score = silhouette_score(
+            self.get_radians(valid_homes),
+            valid_homes["cluster_id"],
+            metric="haversine",
+            sample_size=sample_size,
+            random_state=Config.RANDOM_STATE
+        )
+
+        print("Silhouette score:", score)
+
+        return score
+
+    def process(self, homes):
+
+        outliers = self.detect_coordinate_outliers(homes)
+
+        homes = self.correct_coordinates(
+            homes,
+            outliers
+        )
+
+        homes = self.apply_final_clustering(homes)
+
+        self.calculate_silhouette(homes)
+
+        return homes
+
+
+class PriceProcessor:
+
+    def __init__(self):
+
+        os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(Config.DUCKDB_TEMP_DIR, exist_ok=True)
+
+        self.connection = duckdb.connect(
+            Config.DUCKDB_FILE
+        )
+
+        self.connection.execute(
+            f"SET memory_limit = '{Config.DUCKDB_MEMORY_LIMIT}'"
+        )
+
+        temp_dir = os.path.abspath(Config.DUCKDB_TEMP_DIR)
+        temp_dir = temp_dir.replace("\\", "/")
+
+        self.connection.execute(
+            f"SET temp_directory = '{temp_dir}'"
+        )
+
+    def attach_mysql(self):
+
+        def quote(value):
+            return str(value).replace("'", "''")
+
+        self.connection.execute(f"""
+            CREATE SECRET mysql_secret (
+                TYPE mysql,
+                HOST '{quote(Config.DB_HOST)}',
+                PORT {Config.DB_PORT},
+                DATABASE '{quote(Config.DB_NAME)}',
+                USER '{quote(Config.DB_USER)}',
+                PASSWORD '{quote(Config.DB_PASSWORD)}'
+            )
+        """)
+
+        self.connection.execute("""
+            INSTALL mysql
+        """)
+
+        self.connection.execute("""
+            LOAD mysql
+        """)
+
+        self.connection.execute("""
+            ATTACH '' AS mysql_db (
+                TYPE mysql,
+                SECRET mysql_secret
+            )
+        """)
+
+        print("DuckDB connected directly to MySQL.")
+
+    def create_joined_data(self):
+
+        self.connection.execute("""
+            CREATE OR REPLACE TABLE joined_prices AS
+
+            SELECT
+                p.home_id,
+                TRY_CAST(p.price AS DOUBLE) AS price,
+                CAST(p.createdDate AS DATE) AS created_date,
+                h.cluster_id
+
+            FROM mysql_db.home_prices p
+
+            INNER JOIN mysql_db.home_clusters h
+                ON p.home_id = h.home_id
+
+            WHERE
+                TRY_CAST(p.price AS DOUBLE) IS NOT NULL
+                AND p.createdDate IS NOT NULL
+        """)
+
+        count = self.connection.execute("""
+            SELECT COUNT(*)
+            FROM joined_prices
+        """).fetchone()[0]
+
+        print("Joined price records:", count)
+
+    def detect_global_outliers(self):
+
+        self.connection.execute(f"""
+            CREATE OR REPLACE TABLE global_price_outliers AS
+
+            WITH bounds AS (
+
+                SELECT
+                    QUANTILE_CONT(price, 0.25) AS q1,
+                    QUANTILE_CONT(price, 0.75) AS q3
+
+                FROM joined_prices
+            )
+
+            SELECT
+                p.*,
+                b.q1,
+                b.q3,
+                b.q1 - {Config.IQR_MULTIPLIER} * (b.q3 - b.q1) AS lower_bound,
+                b.q3 + {Config.IQR_MULTIPLIER} * (b.q3 - b.q1) AS upper_bound
+
+            FROM joined_prices p
+            CROSS JOIN bounds b
+
+            WHERE
+                p.price < b.q1 - {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
+                OR
+                p.price > b.q3 + {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
+        """)
+
+        output_path = os.path.join(
+            Config.OUTPUT_DIR,
+            "global_price_outliers.parquet"
+        )
+
+        output_path = os.path.abspath(output_path).replace("\\", "/")
+        output_path = output_path.replace("'", "''")
+
+        self.connection.execute(f"""
+            COPY global_price_outliers
+            TO '{output_path}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+
+        count = self.connection.execute("""
+            SELECT COUNT(*)
+            FROM global_price_outliers
+        """).fetchone()[0]
+
+        print("Global price outliers:", count)
+        print("Global outliers saved separately.")
+
+    def remove_local_outliers(self):
+
+        self.connection.execute(f"""
+            CREATE OR REPLACE TABLE cluster_price_bounds AS
+
+            SELECT
+                cluster_id,
+
+                QUANTILE_CONT(price, 0.25) AS q1,
+                QUANTILE_CONT(price, 0.75) AS q3
+
+            FROM joined_prices
+
+            GROUP BY cluster_id
+        """)
+
+        self.connection.execute(f"""
+            CREATE OR REPLACE TABLE cleaned_prices AS
+
+            SELECT
+                p.home_id,
+                p.price,
+                p.created_date,
+                p.cluster_id
+
+            FROM joined_prices p
+
+            INNER JOIN cluster_price_bounds b
+                ON p.cluster_id = b.cluster_id
+
+            WHERE
+                p.price >= b.q1 -
+                    {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
+
+                AND
+
+                p.price <= b.q3 +
+                    {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
+        """)
+
+        original_count = self.connection.execute("""
+            SELECT COUNT(*)
+            FROM joined_prices
+        """).fetchone()[0]
+
+        cleaned_count = self.connection.execute("""
+            SELECT COUNT(*)
+            FROM cleaned_prices
+        """).fetchone()[0]
+
+        print("Records before local IQR:", original_count)
+        print("Records after local IQR:", cleaned_count)
+        print("Records removed:", original_count - cleaned_count)
+
+    def create_daily_aggregation(self):
+
+        self.connection.execute("""
+            CREATE OR REPLACE TABLE daily_cluster_prices AS
+
+            SELECT
+                cluster_id,
+                created_date,
+
+                AVG(price) AS avg_price,
+                MEDIAN(price) AS median_price,
+
+                COUNT(price) AS price_record_count,
+                COUNT(DISTINCT home_id) AS home_count
+
+            FROM cleaned_prices
+
+            GROUP BY
+                cluster_id,
+                created_date
+
+            ORDER BY
+                cluster_id,
+                created_date
+        """)
+
+        print("Daily cluster aggregation completed.")
+
+    def close(self):
+        self.connection.close()
+
+
+class TrendAnalyzer:
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def cluster_ranking(self):
+
+        query = """
+            WITH ranked_dates AS (
+
+                SELECT
+                    cluster_id,
+                    created_date,
+                    avg_price,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY cluster_id
+                        ORDER BY created_date
+                    ) AS first_row,
+
+                    ROW_NUMBER() OVER (
+                        PARTITION BY cluster_id
+                        ORDER BY created_date DESC
+                    ) AS last_row
+
+                FROM daily_cluster_prices
+            ),
+
+            first_last AS (
+
+                SELECT
+                    cluster_id,
+
+                    MAX(
+                        CASE WHEN first_row = 1
+                        THEN avg_price END
+                    ) AS first_avg_price,
+
+                    MAX(
+                        CASE WHEN last_row = 1
+                        THEN avg_price END
+                    ) AS last_avg_price
+
+                FROM ranked_dates
+
+                GROUP BY cluster_id
+            )
+
+            SELECT
+                cluster_id,
+                first_avg_price,
+                last_avg_price,
+
+                last_avg_price - first_avg_price AS price_difference,
+
+                (
+                    (last_avg_price - first_avg_price)
+                    / NULLIF(first_avg_price, 0)
+                ) * 100 AS percentage_change
+
+            FROM first_last
+
+            ORDER BY percentage_change DESC
+        """
+
+        ranking = self.connection.execute(query).fetchdf()
+
+        ranking["increase_rank"] = (
+            ranking["percentage_change"]
+            .rank(ascending=False, method="dense")
+            .astype("Int64")
+        )
+
+        ranking["decrease_rank"] = (
+            ranking["percentage_change"]
+            .rank(ascending=True, method="dense")
+            .astype("Int64")
+        )
+
+        print("\nCluster price ranking:")
+        print(ranking.to_string(index=False))
+
+        return ranking
+
+    def volatility_analysis(self):
+
+        query = """
+            WITH daily_changes AS (
+
+                SELECT
+                    cluster_id,
+                    created_date,
+                    avg_price,
+
+                    LAG(avg_price) OVER (
+                        PARTITION BY cluster_id
+                        ORDER BY created_date
+                    ) AS previous_avg_price
+
+                FROM daily_cluster_prices
+            ),
+
+            percentage_changes AS (
+
+                SELECT
+                    cluster_id,
+                    created_date,
+
+                    (
+                        (avg_price - previous_avg_price)
+                        / NULLIF(previous_avg_price, 0)
+                    ) * 100 AS percentage_change
+
+                FROM daily_changes
+
+                WHERE previous_avg_price IS NOT NULL
+            )
+
+            SELECT
+                cluster_id,
+
+                STDDEV_SAMP(percentage_change)
+                    AS volatility,
+
+                AVG(percentage_change)
+                    AS average_daily_change,
+
+                AVG(ABS(percentage_change))
+                    AS average_absolute_change,
+
+                MAX(ABS(percentage_change))
+                    AS maximum_absolute_change,
+
+                COUNT(percentage_change)
+                    AS observation_count
+
+            FROM percentage_changes
+
+            GROUP BY cluster_id
+
+            ORDER BY volatility DESC
+        """
+
+        volatility = self.connection.execute(query).fetchdf()
+
+        print("\nCluster volatility:")
+        print(volatility.to_string(index=False))
+
+        return volatility
+
+
+class AnalysisPipeline:
+
+    def __init__(self):
+
+        self.database = DatabaseManager()
+        self.cluster_processor = ClusterProcessor()
+        self.price_processor = PriceProcessor()
+
+    def run(self):
+
+        try:
+            print("\n1. Reading homes from MySQL")
+
+            homes = self.database.read_homes()
+
+            print("Homes loaded:", len(homes))
+
+            print("\n2. Coordinate correction and clustering")
+
+            homes = self.cluster_processor.process(homes)
+
+            print("\n3. Saving clustered homes to MySQL")
+
+            self.database.save_clusters(homes)
+
+            print("\n4. Connecting DuckDB to MySQL")
+
+            self.price_processor.attach_mysql()
+
+            print("\n5. Joining prices with clustered homes")
+
+            self.price_processor.create_joined_data()
+
+            print("\n6. Detecting global IQR outliers")
+
+            self.price_processor.detect_global_outliers()
+
+            print("\n7. Applying local IQR filtering")
+
+            self.price_processor.remove_local_outliers()
+
+            print("\n8. Daily cluster aggregation")
+
+            self.price_processor.create_daily_aggregation()
+
+            print("\n9. Cluster ranking and volatility")
+
+            analyzer = TrendAnalyzer(
+                self.price_processor.connection
+            )
+
+            ranking = analyzer.cluster_ranking()
+
+            volatility = analyzer.volatility_analysis()
+
+            print("\nAnalysis completed.")
+
+            return ranking, volatility
+
+        finally:
+            self.price_processor.close()
+            self.database.close()
+
+
+if __name__ == "__main__":
+
+    pipeline = AnalysisPipeline()
+    ranking, volatility = pipeline.run()
