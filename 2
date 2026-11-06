@@ -1,695 +1,535 @@
 
 import os
+import duckdb
+import pgeocode
 import pandas as pd
 import numpy as np
-import pgeocode
-import duckdb
 
-from sqlalchemy import create_engine, text, URL
+from sqlalchemy import create_engine
 from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
+from google.cloud import storage
 
 
-class Config:
-    DB_HOST = "localhost"
-    DB_PORT = 3306
-    DB_USER = "root"
-    DB_PASSWORD = "your_password"
-    DB_NAME = "your_database"
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-    HOMES_TABLE = "homes"
-    PRICES_TABLE = "home_prices"
-    CLUSTERS_TABLE = "home_clusters"
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "root")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_NAME = os.getenv("DB_NAME", "multifamily")
 
-    HOME_ID = "home_id"
-    LATITUDE = "latitude"
-    LONGITUDE = "longitude"
-    ZIP_CODE = "zip"
-    PRICE = "price"
-    DATE = "createdDate"
+GCS_BUCKET = "bbi-scraped-items-new"
 
-    # Initial DBSCAN: identify incorrect coordinates
-    INITIAL_EPS_KM = 10
-    INITIAL_MIN_SAMPLES = 5
+OUTPUT_DIR = "output"
 
-    # Final DBSCAN
-    FINAL_EPS_KM = 10
-    FINAL_MIN_SAMPLES = 1
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    EARTH_RADIUS_KM = 6371
 
-    SILHOUETTE_SAMPLE_SIZE = 2000
-    RANDOM_STATE = 42
-
-    IQR_MULTIPLIER = 1.5
-
-    DUCKDB_FILE = "housing_analysis.duckdb"
-    DUCKDB_MEMORY_LIMIT = "4GB"
-    DUCKDB_TEMP_DIR = "duckdb_temp"
-
-    OUTPUT_DIR = "output"
-
+# ==========================================
+# DATABASE MANAGER
+# ==========================================
 
 class DatabaseManager:
 
     def __init__(self):
         self.engine = create_engine(
-            URL.create(
-                "mysql+pymysql",
-                username=Config.DB_USER,
-                password=Config.DB_PASSWORD,
-                host=Config.DB_HOST,
-                port=Config.DB_PORT,
-                database=Config.DB_NAME
-            ),
-            pool_pre_ping=True
+            f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@"
+            f"{DB_HOST}:{DB_PORT}/{DB_NAME}"
         )
 
-    def read_homes(self):
-        query = f"""
-            SELECT
-                {Config.HOME_ID},
-                {Config.LATITUDE},
-                {Config.LONGITUDE},
-                {Config.ZIP_CODE}
-            FROM {Config.HOMES_TABLE}
+        self.conn = None
+
+    def get_homes(self):
+        query = """
+        SELECT id, zip, longitude, latitude
+        FROM tricon_american_homes
         """
 
-        with self.engine.connect() as connection:
-            homes = pd.read_sql(text(query), connection)
+        return pd.read_sql(query, self.engine)
 
-        return homes
+    def save_clusters(self, df):
+        df = df.rename(columns={"id": "home_id"})
 
-    def save_clusters(self, homes):
+        df.to_sql(
+            "home_clusters",
+            self.engine,
+            index=False,
+            if_exists="replace",
+            method="multi"
+        )
 
-        columns = [
-            Config.HOME_ID,
-            Config.LATITUDE,
-            Config.LONGITUDE,
-            Config.ZIP_CODE,
-            "cluster_id"
-        ]
+    def connect_duckdb(self):
+        self.conn = duckdb.connect()
 
-        data = homes[columns].copy()
+        self.conn.execute("INSTALL mysql")
+        self.conn.execute("LOAD mysql")
 
-        staging_table = "home_clusters_staging"
+        mysql_connection = (
+            f"host={DB_HOST} "
+            f"user={DB_USER} "
+            f"password={DB_PASSWORD} "
+            f"port={DB_PORT} "
+            f"database={DB_NAME}"
+        )
 
-        with self.engine.begin() as connection:
+        self.conn.execute(
+            f"ATTACH '{mysql_connection}' AS mysqldb (TYPE mysql)"
+        )
 
-            data.to_sql(
-                staging_table,
-                connection,
-                if_exists="replace",
-                index=False
-            )
-
-            connection.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS {Config.CLUSTERS_TABLE}
-                LIKE {staging_table}
-            """))
-
-            connection.execute(text(
-                f"DELETE FROM {Config.CLUSTERS_TABLE}"
-            ))
-
-            connection.execute(text(f"""
-                INSERT INTO {Config.CLUSTERS_TABLE}
-                SELECT * FROM {staging_table}
-            """))
-
-            connection.execute(text(
-                f"DROP TABLE {staging_table}"
-            ))
-
-        print("Clustered homes saved to MySQL.")
+        return self.conn
 
     def close(self):
+        if self.conn:
+            self.conn.close()
+
         self.engine.dispose()
 
 
+# ==========================================
+# GCS MANAGER
+# ==========================================
+
+class GCSManager:
+
+    def __init__(self, bucket_name):
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(bucket_name)
+
+    def upload_file(self, file_path):
+
+        file_name = os.path.basename(file_path)
+
+        blob = self.bucket.blob(file_name)
+
+        blob.upload_from_filename(file_path)
+
+        print(f"Uploaded to GCS: {file_name}")
+
+
+# ==========================================
+# CLUSTER PROCESSOR
+# ==========================================
+
 class ClusterProcessor:
 
-    def __init__(self):
-        self.geocoder = pgeocode.Nominatim("us")
+    def __init__(self, database):
+        self.database = database
 
-    def get_radians(self, homes):
-        coordinates = homes[
-            [Config.LATITUDE, Config.LONGITUDE]
-        ].astype(float)
+    def correct_coordinates(self, df):
 
-        return np.radians(coordinates)
-
-    def detect_coordinate_outliers(self, homes):
-
-        coordinates = self.get_radians(homes)
-
-        model = DBSCAN(
-            eps=Config.INITIAL_EPS_KM / Config.EARTH_RADIUS_KM,
-            min_samples=Config.INITIAL_MIN_SAMPLES,
-            metric="haversine",
-            algorithm="ball_tree"
+        df["longitude"] = pd.to_numeric(
+            df["longitude"], errors="coerce"
         )
 
-        labels = model.fit_predict(coordinates)
+        df["latitude"] = pd.to_numeric(
+            df["latitude"], errors="coerce"
+        )
 
-        outlier_indexes = homes.index[labels == -1]
+        valid = df[
+            ["longitude", "latitude"]
+        ].notna().all(axis=1)
 
-        print("Coordinate outliers:", len(outlier_indexes))
+        labels = pd.Series(-1, index=df.index)
 
-        if len(outlier_indexes) != 2:
-            raise ValueError(
-                f"Expected 2 coordinate outliers, found "
-                f"{len(outlier_indexes)}. Check initial DBSCAN settings."
+        if valid.sum() >= 3:
+
+            scaler = StandardScaler()
+
+            X = scaler.fit_transform(
+                df.loc[valid, ["longitude", "latitude"]]
             )
 
-        return outlier_indexes
+            model = DBSCAN(
+                eps=0.5,
+                min_samples=3
+            )
 
-    def correct_coordinates(self, homes, outlier_indexes):
+            labels.loc[valid] = model.fit_predict(X)
 
-        for index in outlier_indexes:
+        outliers = df[labels == -1]
 
-            zip_code = homes.loc[index, Config.ZIP_CODE]
+        zip_codes = (
+            outliers["zip"]
+            .astype(str)
+            .str.extract(r"(\d{5})")[0]
+        )
 
-            if pd.isna(zip_code):
-                raise ValueError(
-                    f"Missing ZIP code for home {homes.loc[index, Config.HOME_ID]}"
-                )
+        nomi = pgeocode.Nominatim("us")
 
-            zip_code = str(zip_code).split(".")[0].zfill(5)
+        coordinates = nomi.query_postal_code(
+            zip_codes.tolist()
+        )
 
-            result = self.geocoder.query_postal_code(zip_code)
+        valid_coordinates = (
+            coordinates["latitude"].notna()
+            & coordinates["longitude"].notna()
+        )
 
-            latitude = result["latitude"]
-            longitude = result["longitude"]
+        valid_indices = outliers.index[valid_coordinates]
 
-            if pd.isna(latitude) or pd.isna(longitude):
-                raise ValueError(
-                    f"Could not find coordinates for ZIP {zip_code}"
-                )
+        df.loc[valid_indices, "latitude"] = (
+            coordinates.loc[valid_coordinates, "latitude"].values
+        )
 
-            homes.loc[index, Config.LATITUDE] = latitude
-            homes.loc[index, Config.LONGITUDE] = longitude
+        df.loc[valid_indices, "longitude"] = (
+            coordinates.loc[valid_coordinates, "longitude"].values
+        )
 
-        print("Incorrect coordinates corrected using ZIP codes.")
+        return df
 
-        return homes
+    def apply_dbscan(self, df):
 
-    def apply_final_clustering(self, homes):
+        valid = df[
+            ["longitude", "latitude"]
+        ].notna().all(axis=1)
 
-        coordinates = self.get_radians(homes)
+        labels = pd.Series(-1, index=df.index)
+
+        X = np.radians(
+            df.loc[valid, ["longitude", "latitude"]].values
+        )
 
         model = DBSCAN(
-            eps=Config.FINAL_EPS_KM / Config.EARTH_RADIUS_KM,
-            min_samples=Config.FINAL_MIN_SAMPLES,
-            metric="haversine",
-            algorithm="ball_tree"
+            eps=10 / 6371.0088,
+            min_samples=1,
+            algorithm="ball_tree",
+            metric="haversine"
         )
 
-        homes["cluster_id"] = model.fit_predict(coordinates)
+        labels.loc[valid] = model.fit_predict(X)
 
-        print("Total clusters:", homes["cluster_id"].nunique())
-        print("Noise points:", (homes["cluster_id"] == -1).sum())
+        df["cluster"] = labels.astype(int)
 
-        return homes
+        cluster_count = df.loc[
+            df["cluster"] != -1, "cluster"
+        ].nunique()
 
-    def calculate_silhouette(self, homes):
+        print("Total homes:", len(df))
+        print("Number of clusters:", cluster_count)
+        print("Number of outliers:", (df["cluster"] == -1).sum())
 
-        valid_homes = homes[homes["cluster_id"] != -1].copy()
+        if 2 <= cluster_count <= len(X) - 1:
+            score = silhouette_score(
+                X,
+                labels.loc[valid],
+                metric="haversine",
+                sample_size=min(10000, len(X)),
+                random_state=42
+            )
 
-        if valid_homes["cluster_id"].nunique() < 2:
-            print("Silhouette score requires at least 2 clusters.")
-            return None
+            print("Silhouette Score:", score)
 
-        sample_size = min(
-            Config.SILHOUETTE_SAMPLE_SIZE,
-            len(valid_homes)
-        )
+        else:
+            print("Silhouette score cannot be calculated.")
 
-        score = silhouette_score(
-            self.get_radians(valid_homes),
-            valid_homes["cluster_id"],
-            metric="haversine",
-            sample_size=sample_size,
-            random_state=Config.RANDOM_STATE
-        )
+        return df
 
-        print("Silhouette score:", score)
+    def process(self):
 
-        return score
+        df = self.database.get_homes()
 
-    def process(self, homes):
+        df = self.correct_coordinates(df)
 
-        outliers = self.detect_coordinate_outliers(homes)
+        df = self.apply_dbscan(df)
 
-        homes = self.correct_coordinates(
-            homes,
-            outliers
-        )
+        self.database.save_clusters(df)
 
-        homes = self.apply_final_clustering(homes)
+        print("Home clusters saved to MySQL.")
 
-        self.calculate_silhouette(homes)
+        return df
 
-        return homes
 
+# ==========================================
+# PRICE PROCESSOR
+# ==========================================
 
 class PriceProcessor:
 
-    def __init__(self):
+    def __init__(self, conn, gcs):
+        self.conn = conn
+        self.gcs = gcs
 
-        os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-        os.makedirs(Config.DUCKDB_TEMP_DIR, exist_ok=True)
+    def export_parquet(self, query, file_path):
 
-        self.connection = duckdb.connect(
-            Config.DUCKDB_FILE
-        )
-
-        self.connection.execute(
-            f"SET memory_limit = '{Config.DUCKDB_MEMORY_LIMIT}'"
-        )
-
-        temp_dir = os.path.abspath(Config.DUCKDB_TEMP_DIR)
-        temp_dir = temp_dir.replace("\\", "/")
-
-        self.connection.execute(
-            f"SET temp_directory = '{temp_dir}'"
-        )
-
-    def attach_mysql(self):
-
-        def quote(value):
-            return str(value).replace("'", "''")
-
-        self.connection.execute(f"""
-            CREATE SECRET mysql_secret (
-                TYPE mysql,
-                HOST '{quote(Config.DB_HOST)}',
-                PORT {Config.DB_PORT},
-                DATABASE '{quote(Config.DB_NAME)}',
-                USER '{quote(Config.DB_USER)}',
-                PASSWORD '{quote(Config.DB_PASSWORD)}'
-            )
-        """)
-
-        self.connection.execute("""
-            INSTALL mysql
-        """)
-
-        self.connection.execute("""
-            LOAD mysql
-        """)
-
-        self.connection.execute("""
-            ATTACH '' AS mysql_db (
-                TYPE mysql,
-                SECRET mysql_secret
-            )
-        """)
-
-        print("DuckDB connected directly to MySQL.")
-
-    def create_joined_data(self):
-
-        self.connection.execute("""
-            CREATE OR REPLACE TABLE joined_prices AS
-
-            SELECT
-                p.home_id,
-                TRY_CAST(p.price AS DOUBLE) AS price,
-                CAST(p.createdDate AS DATE) AS created_date,
-                h.cluster_id
-
-            FROM mysql_db.home_prices p
-
-            INNER JOIN mysql_db.home_clusters h
-                ON p.home_id = h.home_id
-
-            WHERE
-                TRY_CAST(p.price AS DOUBLE) IS NOT NULL
-                AND p.createdDate IS NOT NULL
-        """)
-
-        count = self.connection.execute("""
-            SELECT COUNT(*)
-            FROM joined_prices
-        """).fetchone()[0]
-
-        print("Joined price records:", count)
-
-    def detect_global_outliers(self):
-
-        self.connection.execute(f"""
-            CREATE OR REPLACE TABLE global_price_outliers AS
-
-            WITH bounds AS (
-
-                SELECT
-                    QUANTILE_CONT(price, 0.25) AS q1,
-                    QUANTILE_CONT(price, 0.75) AS q3
-
-                FROM joined_prices
-            )
-
-            SELECT
-                p.*,
-                b.q1,
-                b.q3,
-                b.q1 - {Config.IQR_MULTIPLIER} * (b.q3 - b.q1) AS lower_bound,
-                b.q3 + {Config.IQR_MULTIPLIER} * (b.q3 - b.q1) AS upper_bound
-
-            FROM joined_prices p
-            CROSS JOIN bounds b
-
-            WHERE
-                p.price < b.q1 - {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
-                OR
-                p.price > b.q3 + {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
-        """)
-
-        output_path = os.path.join(
-            Config.OUTPUT_DIR,
-            "global_price_outliers.parquet"
-        )
-
-        output_path = os.path.abspath(output_path).replace("\\", "/")
-        output_path = output_path.replace("'", "''")
-
-        self.connection.execute(f"""
-            COPY global_price_outliers
-            TO '{output_path}'
+        self.conn.execute(
+            f"""
+            COPY ({query})
+            TO '{file_path}'
             (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+
+        self.gcs.upload_file(file_path)
+
+        print("Parquet created and uploaded:", file_path)
+
+    def create_processing_table(self):
+
+        query = """
+        SELECT
+            p._homeId,
+            CAST(p.price AS DOUBLE) AS price,
+            p.term,
+            p.createdDate,
+            h.cluster,
+            h.longitude,
+            h.latitude
+
+        FROM mysqldb.tricon_american_homes_pricing p
+
+        INNER JOIN mysqldb.home_clusters h
+            ON p._homeId = h.home_id
+
+        WHERE p._homeId IS NOT NULL
+        """
+
+        self.conn.execute(
+            f"""
+            COPY ({query})
+            TO '{OUTPUT_DIR}/1_processing_table.csv'
+            (FORMAT CSV, HEADER)
+            """
+        )
+
+        self.export_parquet(
+            query,
+            f"{OUTPUT_DIR}/1_processing_table.parquet"
+        )
+
+    def clean_price_outliers(self):
+
+        self.conn.execute("""
+        CREATE OR REPLACE TEMP TABLE aggregate_by_term AS
+
+        SELECT
+            _homeId,
+            cluster,
+            AVG(price) AS avg_term_price,
+            createdDate,
+            ANY_VALUE(longitude) AS longitude,
+            ANY_VALUE(latitude) AS latitude
+
+        FROM read_parquet('output/1_processing_table.parquet')
+
+        GROUP BY _homeId, createdDate, cluster
         """)
 
-        count = self.connection.execute("""
-            SELECT COUNT(*)
-            FROM global_price_outliers
-        """).fetchone()[0]
+        self.conn.execute("""
+        CREATE OR REPLACE TEMP TABLE cluster_iqr_bounds AS
 
-        print("Global price outliers:", count)
-        print("Global outliers saved separately.")
+        SELECT
+            cluster,
+            QUANTILE_CONT(avg_term_price, 0.25) AS q1,
+            QUANTILE_CONT(avg_term_price, 0.75) AS q3,
+            q1 - 1.5 * (q3 - q1) AS lower_bound,
+            q3 + 1.5 * (q3 - q1) AS upper_bound
 
-    def remove_local_outliers(self):
+        FROM aggregate_by_term
 
-        self.connection.execute(f"""
-            CREATE OR REPLACE TABLE cluster_price_bounds AS
-
-            SELECT
-                cluster_id,
-
-                QUANTILE_CONT(price, 0.25) AS q1,
-                QUANTILE_CONT(price, 0.75) AS q3
-
-            FROM joined_prices
-
-            GROUP BY cluster_id
+        GROUP BY cluster
         """)
 
-        self.connection.execute(f"""
-            CREATE OR REPLACE TABLE cleaned_prices AS
+        query = """
+        SELECT t.*
 
-            SELECT
-                p.home_id,
-                p.price,
-                p.created_date,
-                p.cluster_id
+        FROM aggregate_by_term t
 
-            FROM joined_prices p
+        INNER JOIN cluster_iqr_bounds q
+            ON t.cluster = q.cluster
 
-            INNER JOIN cluster_price_bounds b
-                ON p.cluster_id = b.cluster_id
+        WHERE t.avg_term_price >= q.lower_bound
+          AND t.avg_term_price <= q.upper_bound
+        """
 
-            WHERE
-                p.price >= b.q1 -
-                    {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
+        self.export_parquet(
+            query,
+            f"{OUTPUT_DIR}/2_cleaned_processing_table.parquet"
+        )
 
-                AND
+    def create_daily_summary(self):
 
-                p.price <= b.q3 +
-                    {Config.IQR_MULTIPLIER} * (b.q3 - b.q1)
-        """)
+        query = """
+        SELECT
+            cluster,
+            AVG(avg_term_price) AS average_price,
+            MEDIAN(avg_term_price) AS median_price,
+            COUNT(DISTINCT _homeId) AS cluster_home_count,
+            createdDate
 
-        original_count = self.connection.execute("""
-            SELECT COUNT(*)
-            FROM joined_prices
-        """).fetchone()[0]
+        FROM read_parquet(
+            'output/2_cleaned_processing_table.parquet'
+        )
 
-        cleaned_count = self.connection.execute("""
-            SELECT COUNT(*)
-            FROM cleaned_prices
-        """).fetchone()[0]
+        GROUP BY createdDate, cluster
 
-        print("Records before local IQR:", original_count)
-        print("Records after local IQR:", cleaned_count)
-        print("Records removed:", original_count - cleaned_count)
+        ORDER BY createdDate, cluster
+        """
 
-    def create_daily_aggregation(self):
+        self.export_parquet(
+            query,
+            f"{OUTPUT_DIR}/3_cluster_daily_summary.parquet"
+        )
 
-        self.connection.execute("""
-            CREATE OR REPLACE TABLE daily_cluster_prices AS
 
-            SELECT
-                cluster_id,
-                created_date,
-
-                AVG(price) AS avg_price,
-                MEDIAN(price) AS median_price,
-
-                COUNT(price) AS price_record_count,
-                COUNT(DISTINCT home_id) AS home_count
-
-            FROM cleaned_prices
-
-            GROUP BY
-                cluster_id,
-                created_date
-
-            ORDER BY
-                cluster_id,
-                created_date
-        """)
-
-        print("Daily cluster aggregation completed.")
-
-    def close(self):
-        self.connection.close()
-
+# ==========================================
+# TREND ANALYZER
+# ==========================================
 
 class TrendAnalyzer:
 
-    def __init__(self, connection):
-        self.connection = connection
+    def __init__(self, conn, gcs):
+        self.conn = conn
+        self.gcs = gcs
 
-    def cluster_ranking(self):
+    def analyze_trends(self):
+
+        self.conn.execute("""
+        CREATE OR REPLACE TEMP TABLE cluster_trends AS
+
+        SELECT
+            *,
+
+            LAG(average_price) OVER (
+                PARTITION BY cluster
+                ORDER BY createdDate
+            ) AS previous_avg_price,
+
+            AVG(average_price) OVER (
+                PARTITION BY cluster
+                ORDER BY createdDate
+                ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+            ) AS moving_avg_7,
+
+            AVG(average_price) OVER (
+                PARTITION BY cluster
+                ORDER BY createdDate
+                ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+            ) AS moving_avg_30,
+
+            STDDEV(average_price) OVER (
+                PARTITION BY cluster
+                ORDER BY createdDate
+                ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+            ) AS price_volatility_7
+
+        FROM read_parquet(
+            'output/3_cluster_daily_summary.parquet'
+        )
+        """)
 
         query = """
-            WITH ranked_dates AS (
+        SELECT
+            *,
 
-                SELECT
-                    cluster_id,
-                    created_date,
-                    avg_price,
+            CASE
+                WHEN previous_avg_price IS NOT NULL
+                 AND previous_avg_price != 0
 
-                    ROW_NUMBER() OVER (
-                        PARTITION BY cluster_id
-                        ORDER BY created_date
-                    ) AS first_row,
+                THEN (
+                    (average_price - previous_avg_price)
+                    / previous_avg_price
+                ) * 100
 
-                    ROW_NUMBER() OVER (
-                        PARTITION BY cluster_id
-                        ORDER BY created_date DESC
-                    ) AS last_row
+            END AS daily_change_pct,
 
-                FROM daily_cluster_prices
-            ),
+            CASE
+                WHEN moving_avg_7 > moving_avg_30
+                    THEN 'Upward'
 
-            first_last AS (
+                WHEN moving_avg_7 < moving_avg_30
+                    THEN 'Downward'
 
-                SELECT
-                    cluster_id,
+                ELSE 'Stable'
 
-                    MAX(
-                        CASE WHEN first_row = 1
-                        THEN avg_price END
-                    ) AS first_avg_price,
+            END AS trend_direction
 
-                    MAX(
-                        CASE WHEN last_row = 1
-                        THEN avg_price END
-                    ) AS last_avg_price
-
-                FROM ranked_dates
-
-                GROUP BY cluster_id
-            )
-
-            SELECT
-                cluster_id,
-                first_avg_price,
-                last_avg_price,
-
-                last_avg_price - first_avg_price AS price_difference,
-
-                (
-                    (last_avg_price - first_avg_price)
-                    / NULLIF(first_avg_price, 0)
-                ) * 100 AS percentage_change
-
-            FROM first_last
-
-            ORDER BY percentage_change DESC
+        FROM cluster_trends
         """
 
-        ranking = self.connection.execute(query).fetchdf()
+        file_path = f"{OUTPUT_DIR}/4_trend_analysis.parquet"
 
-        ranking["increase_rank"] = (
-            ranking["percentage_change"]
-            .rank(ascending=False, method="dense")
-            .astype("Int64")
+        self.conn.execute(
+            f"""
+            COPY ({query})
+            TO '{file_path}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
         )
 
-        ranking["decrease_rank"] = (
-            ranking["percentage_change"]
-            .rank(ascending=True, method="dense")
-            .astype("Int64")
-        )
+        self.gcs.upload_file(file_path)
 
-        print("\nCluster price ranking:")
-        print(ranking.to_string(index=False))
+        print("Trend analysis completed and uploaded.")
 
-        return ranking
 
-    def volatility_analysis(self):
-
-        query = """
-            WITH daily_changes AS (
-
-                SELECT
-                    cluster_id,
-                    created_date,
-                    avg_price,
-
-                    LAG(avg_price) OVER (
-                        PARTITION BY cluster_id
-                        ORDER BY created_date
-                    ) AS previous_avg_price
-
-                FROM daily_cluster_prices
-            ),
-
-            percentage_changes AS (
-
-                SELECT
-                    cluster_id,
-                    created_date,
-
-                    (
-                        (avg_price - previous_avg_price)
-                        / NULLIF(previous_avg_price, 0)
-                    ) * 100 AS percentage_change
-
-                FROM daily_changes
-
-                WHERE previous_avg_price IS NOT NULL
-            )
-
-            SELECT
-                cluster_id,
-
-                STDDEV_SAMP(percentage_change)
-                    AS volatility,
-
-                AVG(percentage_change)
-                    AS average_daily_change,
-
-                AVG(ABS(percentage_change))
-                    AS average_absolute_change,
-
-                MAX(ABS(percentage_change))
-                    AS maximum_absolute_change,
-
-                COUNT(percentage_change)
-                    AS observation_count
-
-            FROM percentage_changes
-
-            GROUP BY cluster_id
-
-            ORDER BY volatility DESC
-        """
-
-        volatility = self.connection.execute(query).fetchdf()
-
-        print("\nCluster volatility:")
-        print(volatility.to_string(index=False))
-
-        return volatility
-
+# ==========================================
+# MAIN PIPELINE
+# ==========================================
 
 class AnalysisPipeline:
 
     def __init__(self):
 
         self.database = DatabaseManager()
-        self.cluster_processor = ClusterProcessor()
-        self.price_processor = PriceProcessor()
+
+        self.gcs = GCSManager(GCS_BUCKET)
 
     def run(self):
 
         try:
-            print("\n1. Reading homes from MySQL")
 
-            homes = self.database.read_homes()
+            print("Starting analysis pipeline...")
 
-            print("Homes loaded:", len(homes))
+            # Step 1: Home clustering
 
-            print("\n2. Coordinate correction and clustering")
-
-            homes = self.cluster_processor.process(homes)
-
-            print("\n3. Saving clustered homes to MySQL")
-
-            self.database.save_clusters(homes)
-
-            print("\n4. Connecting DuckDB to MySQL")
-
-            self.price_processor.attach_mysql()
-
-            print("\n5. Joining prices with clustered homes")
-
-            self.price_processor.create_joined_data()
-
-            print("\n6. Detecting global IQR outliers")
-
-            self.price_processor.detect_global_outliers()
-
-            print("\n7. Applying local IQR filtering")
-
-            self.price_processor.remove_local_outliers()
-
-            print("\n8. Daily cluster aggregation")
-
-            self.price_processor.create_daily_aggregation()
-
-            print("\n9. Cluster ranking and volatility")
-
-            analyzer = TrendAnalyzer(
-                self.price_processor.connection
+            cluster_processor = ClusterProcessor(
+                self.database
             )
 
-            ranking = analyzer.cluster_ranking()
+            cluster_processor.process()
 
-            volatility = analyzer.volatility_analysis()
+            # Step 2: DuckDB connection
 
-            print("\nAnalysis completed.")
+            conn = self.database.connect_duckdb()
 
-            return ranking, volatility
+            # Step 3: Price processing
+
+            price_processor = PriceProcessor(
+                conn,
+                self.gcs
+            )
+
+            price_processor.create_processing_table()
+
+            price_processor.clean_price_outliers()
+
+            price_processor.create_daily_summary()
+
+            # Step 4: Trend analysis
+
+            trend_analyzer = TrendAnalyzer(
+                conn,
+                self.gcs
+            )
+
+            trend_analyzer.analyze_trends()
+
+            print("Analysis pipeline completed successfully.")
 
         finally:
-            self.price_processor.close()
+
             self.database.close()
 
+
+# ==========================================
+# EXECUTION
+# ==========================================
 
 if __name__ == "__main__":
 
     pipeline = AnalysisPipeline()
-    ranking, volatility = pipeline.run()
+
+    pipeline.run()
